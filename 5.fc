@@ -1,0 +1,144 @@
+{-
+
+  TASK 5 - Address encoder
+  Write the method that for any valid MsgAddressInt with addr_std constructor
+  without anycast
+  (see https://github.com/ton-blockchain/ton/blob/master/crypto/block/block.tlb#L105)
+ returns the slice that contain ASCII encoded base64url user-friendly bouncable
+ address (without test-only flag), see https://ton.org/docs/#/howto/step-by-step?id=_1-smart-contract-addresses
+-}
+
+() recv_internal() {
+}
+
+(int) get_from_list(tuple lst, int idx) {
+    int i = 0;
+    while (i < idx) {
+        lst = second(lst);
+        i += 1;
+    }
+    return first(lst);
+}
+
+(slice) convert_to_base64(slice addr) {
+    int byte_sz = 8;
+    int addr_byte_sz = 36;
+    int addr_sz = addr_byte_sz * byte_sz;
+
+    throw_if(102, slice_bits(addr) != addr_sz);
+
+    tuple abc = null();
+    int A = 65;
+    int a = 97;
+    int zero = 48;
+
+    abc = cons(95, abc);  ;; _ instead of /
+    abc = cons(45, abc);  ;; - instead of +
+
+    int i = 9;
+    while (i >= 0) {
+        abc = cons(zero + i, abc);
+        i -= 1;
+    }
+
+    i = 25;
+    while (i >= 0) {
+        abc = cons(a + i, abc);
+        i -= 1;
+    }
+
+    i = 25;
+    while (i >= 0) {
+        abc = cons(A + i, abc);
+        i -= 1;
+    }
+
+;;     ~dump(abc);
+;;     ~dump(get_from_list(abc, 26));
+
+    builder ans = begin_cell();
+    int b1 = -1;
+    int b2 = -1;
+    int b3 = -1;
+
+    i = 2;
+    while (i < addr_byte_sz) {
+        b1 = addr~load_uint(byte_sz);
+        b2 = addr~load_uint(byte_sz);
+        b3 = addr~load_uint(byte_sz);
+
+        ans~store_uint(get_from_list(abc, b1 >> 2), byte_sz);
+        ans~store_uint(get_from_list(abc, ((b1 & 0x03) << 4) | (b2 >> 4)), byte_sz);
+        ans~store_uint(get_from_list(abc, ((b2 & 0x0f) << 2) | (b3 >> 6)), byte_sz);
+        ans~store_uint(get_from_list(abc, b3 & 0x3f), byte_sz);
+
+        i += 3;
+    }
+
+    slice ans_slice = ans.end_cell().begin_parse();
+    return ans_slice;
+}
+
+(slice) calculate_crc16(slice msg) {
+    int byte_sz = 8;
+    int msg_byte_sz = 34;
+    int addr_len = 256;
+
+    throw_if(101, slice_bits(msg) != msg_byte_sz * byte_sz);  ;; must be 34 bytes long
+
+    int data_sz = 34 + 2;
+    slice data = begin_cell()
+        .store_slice(msg)
+
+        ;; two extra zero bytes
+        .store_uint(0, 8)
+        .store_uint(0, 8)
+        .end_cell().begin_parse();
+
+    int poly = 0x1021;
+    int reg = 0;
+    int i = 0;
+    while (i < data_sz) {
+        int byte = data~load_uint(byte_sz);
+
+        int mask = 0x80;
+        while (mask > 0) {
+            reg <<= 1;
+            if (byte & mask) {
+                reg += 1;
+            }
+            mask >>= 1;
+            if (reg > 0xffff) {
+                reg &= 0xffff;
+                reg ^= poly;
+            }
+        }
+
+        i += 1;
+    }
+
+    return begin_cell()
+        .store_uint(reg / addr_len, byte_sz)
+        .store_uint(reg % addr_len, byte_sz)
+        .end_cell().begin_parse();
+}
+
+;; testable
+(slice) encode_address(slice Address) method_id {
+    (int workchain_id, int address) = parse_std_addr(Address);
+
+    slice address_slice = begin_cell()
+        .store_uint(0x11, 8)
+        .store_int(workchain_id, 8)
+        .store_uint(address, 256)
+        .end_cell().begin_parse();
+
+    slice crc16 = calculate_crc16(address_slice);
+
+    slice crc16_address_slice = begin_cell()
+        .store_slice(address_slice)
+        .store_slice(crc16)
+        .end_cell().begin_parse();
+
+    return convert_to_base64(crc16_address_slice);
+}

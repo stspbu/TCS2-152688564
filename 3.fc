@@ -1,0 +1,503 @@
+{-
+
+  TASK 3 - Message validation.
+  Write the method that checks that cell contains valid message
+  in accordance to https://github.com/ton-blockchain/ton/blob/master/crypto/block/block.tlb#L155
+  Note, tests will only cover valid and invalid MessageAny objects,
+  valid MessageRelaxed (which are not simultaneously MessageAny) will not be presented
+  If message is invalid for any reason - method should return (0, null), otherwise
+  it should return (-1, [slice src, slice dest, int amount] ), where src, dest and
+  amount represents source of the message, destination of the message and attached
+  amount of TONs. If any of those values are not presented (or presented as
+  addr_none slice) in the message cell - they should be substituted with null.
+  It is guaranteed that for all tests any HashmapE datatype in message structure
+  is empty hashmaps (has hme_empty constructor).
+  Documentation on TL-B schemes can be found in https://ton.org/docs/#/overviews/TL-B
+-}
+
+() recv_internal() {
+}
+
+(int, slice, slice) validate_maybe_anycast(slice msg) {
+;; anycast_info$_ depth:(#<= 30) { depth >= 1 }
+;;    rewrite_pfx:(bits depth) = Anycast;
+
+    int maybe_tag_sz = 1;
+    if (slice_bits(msg) < maybe_tag_sz) {
+        return (0, null(), msg);
+    }
+    int maybe_tag = msg~load_uint(maybe_tag_sz);
+
+    if (maybe_tag) {
+        int depth_sz = 5;  ;;  ceil(log2(30+1))
+        if (slice_bits(msg) < depth_sz) {
+            return (0, null(), msg);
+        }
+        int depth_min = 1;
+        int depth_max = 30;
+        int depth = msg~load_uint(depth_sz);
+
+        if ((slice_bits(msg) < depth) | (depth < depth_min) | (depth > depth_max)) {
+            return (0, null(), msg);
+        }
+        slice rewrite_pfx = msg~load_bits(depth);
+        return (
+            -1,
+            begin_cell()
+                .store_uint(maybe_tag, maybe_tag_sz)
+                .store_uint(depth, depth_sz)
+                .store_slice(rewrite_pfx)
+                .end_cell().begin_parse(),
+            msg
+        );
+    }
+
+    return (-1, begin_cell().store_uint(maybe_tag, maybe_tag_sz).end_cell().begin_parse(), msg);
+}
+
+(int, slice, slice) validate_address_int(slice msg) {
+;; addr_std$10 anycast:(Maybe Anycast)
+;;    workchain_id:int8 address:bits256  = MsgAddressInt;
+;; addr_var$11 anycast:(Maybe Anycast) addr_len:(## 9)
+;;    workchain_id:int32 address:(bits addr_len) = MsgAddressInt;
+
+    int tag_sz = 2;
+    if (slice_bits(msg) < tag_sz) {
+        return (0, null(), msg);
+    }
+    int tag = msg~load_uint(tag_sz);
+
+    (int status, slice anycast, msg) = validate_maybe_anycast(msg);
+    if (~ status) {
+        return (0, null(), msg);
+    }
+
+    if (tag & 1) {
+        int addr_len_sz = 9;
+        if (slice_bits(msg) < addr_len_sz) {
+            return (0, null(), msg);
+        }
+        int addr_len = msg~load_uint(addr_len_sz);
+
+        int workchain_id_sz = 32;
+        if (slice_bits(msg) < workchain_id_sz) {
+            return (0, null(), msg);
+        }
+        int workchain_id = msg~load_int(workchain_id_sz);
+
+        if (slice_bits(msg) < addr_len) {
+            return (0, null(), msg);
+        }
+        slice addr = msg~load_bits(addr_len);
+        return (
+            -1,
+            begin_cell()
+                .store_uint(tag, tag_sz)
+                .store_slice(anycast)
+                .store_uint(addr_len, addr_len_sz)
+                .store_int(workchain_id, workchain_id_sz)
+                .store_slice(addr).end_cell().begin_parse(),
+            msg
+        );
+    } else {
+        int workchain_id_sz = 8;
+        if (slice_bits(msg) < workchain_id_sz) {
+            return (0, null(), msg);
+        }
+        int workchain_id = msg~load_int(workchain_id_sz);
+
+        int addr_len = 256;
+        if (slice_bits(msg) < addr_len) {
+            return (0, null(), msg);
+        }
+        slice addr = msg~load_bits(addr_len);
+        return (
+            -1,
+            begin_cell()
+                .store_uint(tag, tag_sz)
+                .store_slice(anycast)
+                .store_int(workchain_id, workchain_id_sz)
+                .store_slice(addr).end_cell().begin_parse(),
+            msg
+        );
+    }
+}
+
+(int, slice, slice) validate_address_ext(slice msg) {
+;; addr_none$00 = MsgAddressExt;
+;; addr_extern$01 len:(## 9) external_address:(bits len)
+;;              = MsgAddressExt;
+
+    int tag_sz = 2;
+    if (slice_bits(msg) < tag_sz) {
+        return (0, null(), msg);
+    }
+    int tag = msg~load_uint(tag_sz);
+    if (tag & 1) {
+        int len_sz = 9;
+        if (slice_bits(msg) < len_sz) {
+            return (0, null(), msg);
+        }
+
+        int len = msg~load_uint(len_sz);
+        if (slice_bits(msg) < len) {
+            return (0, null(), msg);
+        }
+
+        slice addr = msg~load_bits(len);
+        return (
+            -1,
+            begin_cell()
+                .store_uint(tag, tag_sz)
+                .store_uint(len, len_sz)
+                .store_slice(addr)
+                .end_cell().begin_parse(),
+            msg
+        );
+    }
+    return (-1, null(), msg);
+}
+
+(int, int, slice) validate_grams(slice msg) {
+;; var_uint$_ {n:#} len:(#< n) value:(uint (len * 8))
+;;          = VarUInteger n;
+;; nanograms$_ amount:(VarUInteger 16) = Grams;
+
+    int len_sz = 4;
+    if (slice_bits(msg) < len_sz) {
+        return (0, 0, msg);
+    }
+    int len = msg~load_uint(len_sz) * 8;
+
+    if (slice_bits(msg) < len) {
+        return (0, 0, msg);
+    }
+    int amount = msg~load_uint(len);
+    return (-1, amount, msg);
+}
+
+(int, slice) validate_empty_hashmap(slice msg) {
+    int hashmap_tag_sz = 1;
+    if (slice_bits(msg) < hashmap_tag_sz) {
+        return (0, msg);
+    }
+    int hashmap_tag = msg~load_uint(hashmap_tag_sz);
+
+    if (hashmap_tag != 0) {
+        return (0, msg);
+;;         int root_sz = 1;
+;;         if (slice_bits(msg) < root_sz) {
+;;             return (0, msg);
+;;         }
+;;         msg~load_ref();
+;;         return (-1, msg);
+    }
+    return (-1, msg);
+}
+
+(int, int, slice) validate_currency_collection(slice msg) {
+;; extra_currencies$_ dict:(HashmapE 32 (VarUInteger 32))
+;;                  = ExtraCurrencyCollection;
+;; currencies$_ grams:Grams other:ExtraCurrencyCollection
+;;            = CurrencyCollection;
+    (int status, int amount, msg) = validate_grams(msg);
+    if (~ status) {
+        return (0, 0, msg);
+    }
+
+    (status, msg) = validate_empty_hashmap(msg);
+    if (~ status) {
+        return (0, 0, msg);
+    }
+
+    return (-1, amount, msg);
+}
+
+(int, slice) validate_maybe_cell_ref(slice msg) {
+    int maybe_tag_sz = 1;
+    if (slice_bits(msg) < maybe_tag_sz) {
+        return (0, msg);
+    }
+    int maybe_tag = msg~load_uint(maybe_tag_sz);
+    if (maybe_tag == 0) {
+        return (-1, msg);
+    }
+
+    if (slice_refs(msg) < 1) {
+        return (0, msg);
+    }
+    msg~load_ref();
+    return (-1, msg);
+}
+
+(int, slice) validate_maybe_tik_tok(slice msg) {
+;; special:(Maybe TickTock)
+;;      tick_tock$_
+;;          tick:Bool
+;;          tock:Bool = TickTock;
+;;
+    int maybe_tag_sz = 1;
+    if (slice_bits(msg) < maybe_tag_sz) {
+        return (0, msg);
+    }
+    int maybe_tag = msg~load_uint(maybe_tag_sz);
+    if (maybe_tag == 0) {
+        return (-1, msg);
+    }
+
+    int tick_tock_sz = 1 + 1;
+    if (slice_bits(msg) < tick_tock_sz) {
+        return (0, msg);
+    }
+    msg~load_uint(tick_tock_sz);
+    return (-1, msg);
+}
+
+(int, slice) validate_maybe_depth(slice msg) {
+;;     split_depth:(Maybe (## 5))
+    int maybe_tag_sz = 1;
+    if (slice_bits(msg) < maybe_tag_sz) {
+        return (0, msg);
+    }
+    int maybe_tag = msg~load_uint(maybe_tag_sz);
+    if (maybe_tag == 0) {
+        return (-1, msg);
+    }
+
+    int split_depth_sz = 5;
+    if (slice_bits(msg) < split_depth_sz) {
+        return (0, msg);
+    }
+    msg~load_uint(split_depth_sz);
+    return (-1, msg);
+}
+
+(int, slice) validate_state_init(slice msg) {
+;;      _
+;;          split_depth:(Maybe (## 5))
+;;          special:(Maybe TickTock)
+;;          code:(Maybe ^Cell)
+;;          data:(Maybe ^Cell)
+;;          library:(HashmapE 256 SimpleLib) = StateInit;
+
+    (int status, msg) = validate_maybe_depth(msg);
+    if (~ status) {
+        return (0, msg);
+    }
+
+    (status, msg) = validate_maybe_tik_tok(msg);
+    if (~ status) {
+        return (0, msg);
+    }
+
+    (status, msg) = validate_maybe_cell_ref(msg);
+    if (~ status) {
+        return (0, msg);
+    }
+
+    (status, msg) = validate_maybe_cell_ref(msg);
+    if (~ status) {
+        return (0, msg);
+    }
+
+    (status, msg) = validate_empty_hashmap(msg);
+    if (~ status) {
+        return (0, msg);
+    }
+
+    return (-1, msg);
+}
+
+(int, slice) validate_init(slice msg) {
+;;  init:(Maybe (Either StateInit ^StateInit))
+    int maybe_tag_sz = 1;
+    if (slice_bits(msg) < maybe_tag_sz) {
+        return (0, msg);
+    }
+    int maybe_tag = msg~load_uint(maybe_tag_sz);
+
+    if (maybe_tag) {
+        int either_tag_sz = 1;
+        if (slice_bits(msg) < either_tag_sz) {
+            return (0, msg);
+        }
+        int either_tag = msg~load_uint(either_tag_sz);
+
+        ;; Either StateInit ^StateInit
+        if (either_tag) {
+            if (slice_refs(msg) < 1) {
+                return (0, msg);
+            }
+            slice state_init = msg~load_ref().begin_parse();
+            (int status, state_init) = validate_state_init(state_init);
+            if (~ status) {
+                return (0, msg);
+            }
+
+            return (-1, msg);
+        }
+
+        (int status, msg) = validate_state_init(msg);
+        if (~ status) {
+            return (0, msg);
+        }
+
+        return (-1, msg);
+    }
+
+    return (-1, msg);
+}
+
+(int) validate_init_and_body(slice msg) {
+;;  init:(Maybe (Either StateInit ^StateInit))
+;;  body:(Either X ^X) = Message X;
+
+    (int status, msg) = validate_init(msg);
+    if (~ status) {
+        return 0;
+    }
+
+    int either_tag_sz = 1;
+    if (slice_bits(msg) < either_tag_sz) {
+        return 0;
+    }
+    int either_tag = msg~load_uint(either_tag_sz);
+
+    ;; Either X ^X
+    if (either_tag) {
+        if (slice_refs(msg) < 1) {
+            return 0;
+        }
+        msg~load_ref();
+        return -1;
+    }
+
+    ;; body is not validated
+
+    return -1;
+}
+
+;; testable
+(int, tuple) validate_message(cell message) method_id {
+    if (cell_null?(message)) {
+        return (0, null());
+    }
+
+    int sz = 1;
+    slice msg = message.begin_parse();
+    if (slice_bits(msg) < sz) {
+        return (0, null());
+    }
+    int tag = msg~load_uint(sz);
+
+    if (tag == 0) {
+        ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool
+        ;;   src:MsgAddressInt dest:MsgAddressInt
+        ;;   value:CurrencyCollection ihr_fee:Grams fwd_fee:Grams
+        ;;   created_lt:uint64 created_at:uint32 = CommonMsgInfo;
+
+        sz = 1 + 1 + 1;  ;; ihr_disabled:Bool bounce:Bool bounced:Bool
+        if (slice_bits(msg) < sz) {
+            return (0, null());
+        }
+        msg~load_uint(sz);
+
+        int status = -1;
+        (status, slice src, msg) = validate_address_int(msg);
+        if (~ status) {
+            return (0, null());
+        }
+        (status, slice dest, msg) = validate_address_int(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        (status, int amount, msg) = validate_currency_collection(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        (status, int inr_fee, msg) = validate_grams(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        (status, int fwd_fee, msg) = validate_grams(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        int created_lt_sz = 64;
+        int created_at_sz = 32;
+        if (slice_bits(msg) < created_lt_sz + created_at_sz) {
+            return (0, null());
+        }
+        msg~load_uint(created_lt_sz + created_at_sz);
+
+        status = validate_init_and_body(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        return (-1, unsafe_tuple([src, dest, amount]));
+    }
+
+    int tag2_sz = 1;
+    if (slice_bits(msg) < tag2_sz) {
+        return (0, null());
+    }
+    int tag2 = msg~load_uint(tag2_sz);
+
+    if (tag2 == 0) {
+        ;; ext_in_msg_info$10 src:MsgAddressExt dest:MsgAddressInt
+        ;;   import_fee:Grams = CommonMsgInfo;
+        int status = -1;
+        (status, slice src, msg) = validate_address_ext(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        (status, slice dest, msg) = validate_address_int(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        (status, int grams, msg) = validate_grams(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        status = validate_init_and_body(msg);
+        if (~ status) {
+            return (0, null());
+        }
+
+        return (-1, unsafe_tuple([src, dest, null()]));
+    }
+
+    ;; ext_out_msg_info$11 src:MsgAddressInt dest:MsgAddressExt
+    ;;   created_lt:uint64 created_at:uint32 = CommonMsgInfo;
+    int status = -1;
+    (status, slice src, msg) = validate_address_int(msg);
+    if (~ status) {
+        return (0, null());
+    }
+
+    (status, slice dest, msg) = validate_address_ext(msg);
+    if (~ status) {
+        return (0, null());
+    }
+    int created_lt_sz = 64;
+    int created_at_sz = 32;
+    if (slice_bits(msg) < created_lt_sz + created_at_sz) {
+        return (0, null());
+    }
+    msg~load_uint(created_lt_sz + created_at_sz);
+
+    status = validate_init_and_body(msg);
+    if (~ status) {
+        return (0, null());
+    }
+
+    return (-1, unsafe_tuple([src, dest,  null()]));
+}
